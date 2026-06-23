@@ -39,7 +39,8 @@ from .expr import Expr
 from .rerankers.base import Reranker
 from .rerankers.rrf import RRFReranker
 from .rerankers.util import check_reranker_result
-from .util import flatten_columns
+from .schema import blob_column_paths, is_blob_like_field, schema_has_blob_field
+from .util import flatten_columns, get_uri_scheme
 
 BlobMode = Literal["lazy", "bytes", "descriptions"]
 
@@ -79,19 +80,32 @@ def _validate_blob_mode(blob_mode: BlobMode) -> None:
         raise ValueError(f"blob_mode must be one of {modes}, got {blob_mode!r}")
 
 
-def _field_is_blob(field: pa.Field) -> bool:
-    metadata = field.metadata or {}
-    return metadata.get(b"lance-encoding:blob") == b"true" or (
-        metadata.get("lance-encoding:blob") == "true"
-    )
+def _supports_blob_auto_row_id(table: Union["Table", "AsyncTable"]) -> bool:
+    """Blob auto row-id is local-only until cloud blob fetch ships."""
+    from .remote.table import RemoteTable
 
+    if isinstance(table, RemoteTable):
+        return False
 
-def _schema_has_blob_field(schema: pa.Schema) -> bool:
-    return any(_field_is_blob(field) for field in schema)
+    inner = getattr(table, "_inner", None)
+    if inner is not None:
+        database = getattr(inner, "database", None)
+        if callable(database):
+            uri = getattr(database(), "uri", None)
+            if isinstance(uri, str) and get_uri_scheme(uri) == "db":
+                return False
+
+    conn = getattr(table, "_conn", None)
+    if conn is not None:
+        uri = getattr(conn, "uri", None)
+        if isinstance(uri, str) and get_uri_scheme(uri) == "db":
+            return False
+
+    return True
 
 
 def _blob_mode_requires_native_pandas(blob_mode: BlobMode, schema: pa.Schema) -> bool:
-    return blob_mode in _BLOB_MODE_TO_HANDLING and _schema_has_blob_field(schema)
+    return blob_mode in _BLOB_MODE_TO_HANDLING and schema_has_blob_field(schema)
 
 
 def _unsupported_blob_pandas_error(reason: str) -> RuntimeError:
@@ -100,6 +114,29 @@ def _unsupported_blob_pandas_error(reason: str) -> RuntimeError:
         f"to_pandas(), but {reason}. Use a plain scan query or remove blob "
         "columns from the projection."
     )
+
+
+def _projection_returns_blob_column(columns: Any, blob_columns: set[str]) -> bool:
+    if not blob_columns:
+        return False
+    if columns is None:
+        return True
+    if isinstance(columns, dict):
+        return any(
+            name in blob_columns or (isinstance(expr, str) and expr in blob_columns)
+            for name, expr in columns.items()
+        )
+    if isinstance(columns, list):
+        for column in columns:
+            if isinstance(column, str) and column in blob_columns:
+                return True
+            if isinstance(column, tuple) and len(column) == 2:
+                name, expr = column
+                if name in blob_columns or (
+                    isinstance(expr, str) and expr in blob_columns
+                ):
+                    return True
+    return False
 
 
 def _query_is_plain_scan(query: Query) -> bool:
@@ -194,11 +231,11 @@ def _scanner_fragments_for_query(query: Query, dataset: Optional[Any]) -> Option
 def _ensure_lazy_blob_frame(
     df: "pd.DataFrame", schema: pa.Schema, blob_mode: BlobMode
 ) -> "pd.DataFrame":
-    if blob_mode != "lazy" or not _schema_has_blob_field(schema) or len(df) == 0:
+    if blob_mode != "lazy" or not schema_has_blob_field(schema) or len(df) == 0:
         return df
 
     for field in schema:
-        if not _field_is_blob(field) or field.name not in df.columns:
+        if not is_blob_like_field(field) or field.name not in df.columns:
             continue
         value = df[field.name].iloc[0]
         if value is not None and not hasattr(value, "readall"):
@@ -239,7 +276,7 @@ def _scanner_to_pandas(scanner: Any, blob_mode: BlobMode, **kwargs) -> "pd.DataF
         return df
 
     tbl = _scanner_to_table(scanner)
-    if blob_mode == "lazy" and _schema_has_blob_field(tbl.schema):
+    if blob_mode == "lazy" and schema_has_blob_field(tbl.schema):
         raise _unsupported_blob_pandas_error(
             "the Lance scanner does not expose to_pandas"
         )
@@ -1169,6 +1206,22 @@ class LanceQueryBuilder(ABC):
         self._with_row_id = with_row_id
         return self
 
+    def _effective_with_row_id(self) -> Optional[bool]:
+        if self._with_row_id is not None:
+            return self._with_row_id
+        if self._returns_blob_column():
+            return True
+        return None
+
+    def _returns_blob_column(self) -> bool:
+        if not _supports_blob_auto_row_id(self._table):
+            return False
+        schema = self._table.schema
+        if not isinstance(schema, pa.Schema):
+            return False
+        blob_columns = set(blob_column_paths(schema))
+        return _projection_returns_blob_column(self._columns, blob_columns)
+
     def with_row_address(self, with_row_address: bool = True) -> Self:
         """Set whether to return row addresses.
 
@@ -1623,7 +1676,7 @@ class LanceVectorQueryBuilder(LanceQueryBuilder):
             upper_bound=self._upper_bound,
             refine_factor=self._refine_factor,
             vector_column=self._vector_column,
-            with_row_id=self._with_row_id,
+            with_row_id=self._effective_with_row_id(),
             with_row_address=self._with_row_address,
             fragments=self._fragments,
             fragment_ids=self._fragment_ids,
@@ -1828,7 +1881,7 @@ class LanceFtsQueryBuilder(LanceQueryBuilder):
             filter=self._where,
             limit=self._limit,
             postfilter=self._postfilter,
-            with_row_id=self._with_row_id,
+            with_row_id=self._effective_with_row_id(),
             with_row_address=self._with_row_address,
             fragments=self._fragments,
             fragment_ids=self._fragment_ids,
@@ -1901,7 +1954,7 @@ class LanceEmptyQueryBuilder(LanceQueryBuilder):
             columns=self._columns,
             filter=self._where,
             limit=self._limit,
-            with_row_id=self._with_row_id,
+            with_row_id=self._effective_with_row_id(),
             with_row_address=self._with_row_address,
             fragments=self._fragments,
             fragment_ids=self._fragment_ids,
@@ -2513,6 +2566,25 @@ class AsyncQueryBase(object):
         query.fragment_ids = self._fragment_ids
         return query
 
+    async def _maybe_add_blob_row_id(self) -> None:
+        if self._table is None:
+            return
+
+        if not _supports_blob_auto_row_id(self._table):
+            return
+
+        schema = await self._table.schema()
+        if not schema_has_blob_field(schema):
+            return
+
+        req = self._inner.to_query_request()
+        if req.with_row_id:
+            return
+
+        blob_columns = set(blob_column_paths(schema))
+        if _projection_returns_blob_column(req.select, blob_columns):
+            self._inner.with_row_id()
+
     def select(self, columns: Union[List[str], dict[str, str]]) -> Self:
         """
         Return only the specified columns.
@@ -2611,6 +2683,7 @@ class AsyncQueryBase(object):
             If not specified, no timeout is applied. If the query does not
             complete within the specified time, an error will be raised.
         """
+        await self._maybe_add_blob_row_id()
         return AsyncRecordBatchReader(
             await self._inner.execute(
                 max_batch_length=max_batch_length, timeout=timeout
