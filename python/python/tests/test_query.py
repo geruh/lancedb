@@ -2068,3 +2068,32 @@ def test_blob_v2_to_batches_row_id(tmp_db):
     assert "_rowid" in hits.column_names
     blobs = table.fetch_blobs("blob", hits)
     assert [blobs[i].as_py() for i in range(len(blobs))] == [b"one", b"two"]
+
+
+@pytest.mark.asyncio
+async def test_nearest_to_keeps_explicit_query_state(table_async: AsyncTable):
+    vector_query = table_async.query().with_row_id().nearest_to([1, 2])
+    assert vector_query._user_requested_row_id()
+    assert vector_query.to_query_object().with_row_id
+
+    hits = await vector_query.limit(2).to_arrow()
+    assert "_rowid" in hits.column_names
+
+
+@pytest.mark.asyncio
+async def test_nearest_to_text_keeps_explicit_query_state(table_async: AsyncTable):
+    await table_async.create_index("text", config=lancedb.index.FTS())
+    fts_query = table_async.query().with_row_id().nearest_to_text("dog")
+
+    assert fts_query._user_requested_row_id()
+    hits = await fts_query.limit(2).to_arrow()
+    assert "_rowid" in hits.column_names
+
+
+def test_with_row_id_false_keeps_blob_projection_clean(tmp_db):
+    table = tmp_db.create_table("test_with_row_id_false_blob", _blob_query_data())
+
+    hits = table.search().select(["blob"]).limit(1).with_row_id(False).to_arrow()
+
+    assert "_rowid" not in hits.column_names
+    assert "_lance_row_id" not in hits.schema.field("blob").type.names

@@ -5365,8 +5365,10 @@ class AsyncTable:
             async_query = async_query.fast_search()
         if query.use_lsm is not None:
             async_query = async_query.use_lsm(query.use_lsm)
-        if query.with_row_id:
-            async_query = async_query.with_row_id()
+        # None means the caller said nothing, which lets a blob projection add a row
+        # id of its own. False is a real answer and has to survive the crossing.
+        if query.with_row_id is not None:
+            async_query = async_query.with_row_id(query.with_row_id)
         if query.order_by:
             async_query = async_query.order_by(query.order_by)
 
