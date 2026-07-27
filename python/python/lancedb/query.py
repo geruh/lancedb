@@ -23,6 +23,8 @@ from typing import (
     runtime_checkable,
 )
 
+import warnings
+
 import deprecation
 import numpy as np
 import pyarrow as pa
@@ -1182,6 +1184,16 @@ class LanceQueryBuilder(ABC):
             if isinstance(self, LanceVectorQueryBuilder):
                 raise ValueError("Limit is required for ANN/KNN queries")
             else:
+                if limit is not None:
+                    # Asking for nothing and being handed the whole table is a bad
+                    # surprise on a large one. Vector queries already reject this.
+                    warnings.warn(
+                        f"limit({limit}) currently returns every row. Pass None if "
+                        "that is what you want. A future release will treat a "
+                        "non-positive limit as an error.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
                 self._limit = None
         else:
             self._limit = limit

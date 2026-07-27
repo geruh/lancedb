@@ -18,6 +18,8 @@ import numpy as np
 import pandas.testing as tm
 import pyarrow as pa
 import pyarrow.compute as pc
+import warnings
+
 import pytest
 import pytest_asyncio
 from lancedb.pydantic import LanceModel, Vector
@@ -2068,3 +2070,20 @@ def test_blob_v2_to_batches_row_id(tmp_db):
     assert "_rowid" in hits.column_names
     blobs = table.fetch_blobs("blob", hits)
     assert [blobs[i].as_py() for i in range(len(blobs))] == [b"one", b"two"]
+
+
+def test_limit_zero_warns_that_it_returns_everything(tmp_db):
+    table = tmp_db.create_table("test_limit_zero", [{"id": 1}, {"id": 2}])
+
+    with pytest.warns(DeprecationWarning, match="returns every row"):
+        rows = table.search().limit(0).to_arrow()
+
+    assert rows.num_rows == 2, "behaviour is unchanged for now, only announced"
+
+
+def test_limit_none_stays_silent(tmp_db):
+    table = tmp_db.create_table("test_limit_none", [{"id": 1}, {"id": 2}])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        assert table.search().limit(None).to_arrow().num_rows == 2
