@@ -847,7 +847,7 @@ async fn fetch_blobs_with_precompaction_row_ids_survives_compaction() -> Result<
 }
 
 #[tokio::test]
-async fn zero_length_blob_reads_back_as_null() -> Result<()> {
+async fn zero_length_blob_reads_back_as_empty_not_null() -> Result<()> {
     let tmp = tempdir().unwrap();
     let db = connect(tmp.path().to_str().unwrap()).execute().await?;
     let table = create_inline_blob_table(&db, "t", &[1], &[Some(b"".as_slice())]).await?;
@@ -855,7 +855,43 @@ async fn zero_length_blob_reads_back_as_null() -> Result<()> {
     let ids = collect_row_ids(&table).await?;
     let bytes = table.fetch_blobs("image", &ids).await?;
     assert_eq!(bytes.len(), 1);
-    assert!(bytes.is_null(0));
+    assert!(!bytes.is_null(0), "a written empty value is not a null one");
+    assert_eq!(bytes.value(0), b"");
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_and_null_blobs_stay_distinct_across_a_selection() -> Result<()> {
+    let tmp = tempdir().unwrap();
+    let db = connect(tmp.path().to_str().unwrap()).execute().await?;
+    let table = create_inline_blob_table(
+        &db,
+        "t",
+        &[1, 2, 3, 4],
+        &[
+            Some(b"one".as_slice()),
+            None,
+            Some(b"".as_slice()),
+            Some(b"four".as_slice()),
+        ],
+    )
+    .await?;
+    let ids = collect_row_ids(&table).await?;
+
+    // Every window, not just the whole table. A selection ending on the empty row
+    // used to fail outright, and one containing it used to lose the distinction.
+    for window in [&ids[..], &ids[0..3], &ids[1..3], &ids[2..3], &ids[1..4]] {
+        let bytes = table.fetch_blobs("image", window).await?;
+        assert_eq!(bytes.len(), window.len(), "window {window:?}");
+        for (offset, row_id) in window.iter().enumerate() {
+            let expected_null = *row_id == ids[1];
+            assert_eq!(
+                bytes.is_null(offset),
+                expected_null,
+                "row {row_id} in window {window:?}"
+            );
+        }
+    }
     Ok(())
 }
 
