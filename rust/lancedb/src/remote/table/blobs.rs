@@ -52,7 +52,7 @@ impl<S: HttpSend> RemoteTable<S> {
             .post_read(&format!("/v1/table/{}/fetch_blobs/", self.identifier))
             .json(&body);
         let (request_id, response) = self.send(request, true).await?;
-        let mut stream = self.read_arrow_stream(&request_id, response).await?;
+        let mut stream = self.read_arrow_response(&request_id, response).await?;
 
         let mut blob_chunks: Vec<Arc<dyn Array>> = Vec::new();
         while let Some(batch) = stream.try_next().await? {

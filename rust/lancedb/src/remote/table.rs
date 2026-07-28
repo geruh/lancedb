@@ -9,10 +9,10 @@ use crate::blob::BlobFile;
 use crate::expr::expr_to_sql_string;
 use crate::table::write_progress::FinishOnDrop;
 
-use super::ARROW_STREAM_CONTENT_TYPE;
 use super::client::RequestResultExt;
 use super::client::{HttpSend, RestfulLanceDbClient, Sender};
 use super::db::ServerVersion;
+use super::{ARROW_FILE_CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE};
 use crate::data::scannable::{PeekedScannable, Scannable, estimate_write_partitions};
 use crate::index::Index;
 use crate::index::IndexStatistics;
@@ -47,8 +47,8 @@ use crate::{
     },
 };
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
-use arrow_ipc::reader::FileReader;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_ipc::reader::{FileReader, StreamReader};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion_common::DataFusionError;
@@ -610,19 +610,39 @@ impl<S: HttpSend> RemoteTable<S> {
         result
     }
 
-    async fn read_arrow_stream(
+    async fn read_arrow_response(
         &self,
         request_id: &str,
         response: reqwest::Response,
     ) -> Result<SendableRecordBatchStream> {
         let response = self.check_table_response(request_id, response).await?;
 
-        // There isn't a way to actually stream this data yet. I have an upstream issue:
-        // https://github.com/apache/arrow-rs/issues/6420
+        // The header has to be read before the body, which consumes the response.
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let framing = resolve_arrow_ipc_framing(content_type.as_deref(), request_id)?;
+
+        // Buffer the whole body. File framing keeps its footer at the end, so /query
+        // cannot decode incrementally. Stream framing could, via
+        // arrow_ipc::reader::StreamDecoder, but fetch_blobs concatenates every batch
+        // before returning, so no caller would see data sooner.
         let body = response.bytes().await.err_to_http(request_id.into())?;
-        let reader = FileReader::try_new(Cursor::new(body), None)?;
-        let schema = reader.schema();
-        let stream = futures::stream::iter(reader).map_err(DataFusionError::from);
+        type IpcBatchIterator =
+            Box<dyn Iterator<Item = std::result::Result<RecordBatch, ArrowError>> + Send>;
+        let (schema, batches): (SchemaRef, IpcBatchIterator) = match framing {
+            ArrowIpcFraming::Stream => {
+                let reader = StreamReader::try_new(Cursor::new(body), None)?;
+                (reader.schema(), Box::new(reader))
+            }
+            ArrowIpcFraming::File => {
+                let reader = FileReader::try_new(Cursor::new(body), None)?;
+                (reader.schema(), Box::new(reader))
+            }
+        };
+        let stream = futures::stream::iter(batches).map_err(DataFusionError::from);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
@@ -994,7 +1014,7 @@ impl<S: HttpSend> RemoteTable<S> {
         let futures = requests.into_iter().map(|req| async move {
             let (request_id, response) = self.send(req, true).await?;
             self.track_read_version_from_headers(response.headers());
-            self.read_arrow_stream(&request_id, response).await
+            self.read_arrow_response(&request_id, response).await
         });
         let streams = futures::future::try_join_all(futures);
 
@@ -1058,6 +1078,47 @@ struct TableDescription {
     version: u64,
     schema: JsonSchema,
     location: Option<String>,
+}
+
+/// How a response body frames its Arrow IPC payload. `/query` answers with file framing
+/// and `fetch_blobs` with stream framing, so the reader is picked per response.
+enum ArrowIpcFraming {
+    File,
+    Stream,
+}
+
+/// A response with no `Content-Type` uses file framing, preserving this helper's
+/// behavior before `fetch_blobs` introduced stream responses.
+fn resolve_arrow_ipc_framing(
+    content_type: Option<&str>,
+    request_id: &str,
+) -> Result<ArrowIpcFraming> {
+    let Some(media_type) = content_type.map(base_media_type) else {
+        return Ok(ArrowIpcFraming::File);
+    };
+    if media_type.eq_ignore_ascii_case(ARROW_STREAM_CONTENT_TYPE) {
+        return Ok(ArrowIpcFraming::Stream);
+    }
+    if media_type.eq_ignore_ascii_case(ARROW_FILE_CONTENT_TYPE) {
+        return Ok(ArrowIpcFraming::File);
+    }
+    Err(Error::Http {
+        source: format!(
+            "Expected an Arrow IPC response with Content-Type '{ARROW_STREAM_CONTENT_TYPE}' \
+            or '{ARROW_FILE_CONTENT_TYPE}', got '{media_type}'"
+        )
+        .into(),
+        request_id: request_id.into(),
+        status_code: None,
+    })
+}
+
+/// Strip media-type parameters before matching against the Arrow content types.
+fn base_media_type(content_type: &str) -> &str {
+    match content_type.split_once(';') {
+        Some((media_type, _parameters)) => media_type.trim(),
+        None => content_type.trim(),
+    }
 }
 
 /// Extract an Error from Arc<Error>, reconstructing if the Arc is shared.
@@ -2978,7 +3039,6 @@ mod tests {
             AnalyzePlanDistributedMetrics, ColumnOrdering, ExecutableQuery, QueryBase,
             QueryExecutionOptions,
         },
-        remote::ARROW_FILE_CONTENT_TYPE,
     };
 
     #[tokio::test]
@@ -3154,6 +3214,17 @@ mod tests {
                 options,
             )
             .expect("Failed to create writer");
+            writer.write(data).expect("Failed to write data");
+            writer.finish().expect("Failed to finish");
+        }
+        body
+    }
+
+    fn write_ipc_stream_uncompressed(data: &RecordBatch) -> Vec<u8> {
+        let mut body = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut body, &data.schema())
+                .expect("Failed to create writer");
             writer.write(data).expect("Failed to write data");
             writer.finish().expect("Failed to finish");
         }
@@ -3892,8 +3963,8 @@ mod tests {
 
                 http::Response::builder()
                     .status(200)
-                    .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
-                    .body(write_ipc_file(&expected_ref))
+                    .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
+                    .body(write_ipc_stream_uncompressed(&expected_ref))
                     .unwrap()
             },
         );
@@ -3926,7 +3997,7 @@ mod tests {
 
         let mut body = Vec::new();
         {
-            let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut body, &schema).unwrap();
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut body, &schema).unwrap();
             writer.write(&first_batch).unwrap();
             writer.write(&second_batch).unwrap();
             writer.finish().unwrap();
@@ -3939,7 +4010,7 @@ mod tests {
                 assert_eq!(request.url().path(), "/v1/table/my_table/fetch_blobs/");
                 http::Response::builder()
                     .status(200)
-                    .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                    .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
                     .body(body.clone())
                     .unwrap()
             },
@@ -3953,20 +4024,27 @@ mod tests {
     }
 
     fn table_with_fetch_blobs_response(body: Vec<u8>) -> Table {
+        table_with_fetch_blobs_content_type(Some(ARROW_STREAM_CONTENT_TYPE), body)
+    }
+
+    fn table_with_fetch_blobs_content_type(
+        content_type: Option<&'static str>,
+        body: Vec<u8>,
+    ) -> Table {
         Table::new_with_handler_version("my_table", semver::Version::new(0, 5, 0), move |request| {
             assert_eq!(request.url().path(), "/v1/table/my_table/fetch_blobs/");
-            http::Response::builder()
-                .status(200)
-                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
-                .body(body.clone())
-                .unwrap()
+            let mut response = http::Response::builder().status(200);
+            if let Some(content_type) = content_type {
+                response = response.header(CONTENT_TYPE, content_type);
+            }
+            response.body(body.clone()).unwrap()
         })
     }
 
-    fn one_row_blob_ipc(column: &str) -> Vec<u8> {
+    fn one_row_blob_batch(column: &str) -> RecordBatch {
         let mut builder = LargeBinaryBuilder::new();
         builder.append_value(b"alpha");
-        let batch = RecordBatch::try_new(
+        RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 column,
                 DataType::LargeBinary,
@@ -3974,13 +4052,16 @@ mod tests {
             )])),
             vec![Arc::new(builder.finish())],
         )
-        .unwrap();
-        write_ipc_file(&batch)
+        .unwrap()
+    }
+
+    fn one_row_blob_ipc_stream(column: &str) -> Vec<u8> {
+        write_ipc_stream_uncompressed(&one_row_blob_batch(column))
     }
 
     #[tokio::test]
     async fn test_fetch_blobs_sends_the_checked_out_version() {
-        let ipc = one_row_blob_ipc("image");
+        let ipc = one_row_blob_ipc_stream("image");
         let table = Table::new_with_handler_version(
             "my_table",
             semver::Version::new(0, 5, 0),
@@ -3997,7 +4078,7 @@ mod tests {
                     );
                     http::Response::builder()
                         .status(200)
-                        .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                        .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
                         .body(ipc.clone())
                         .unwrap()
                 }
@@ -4013,7 +4094,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_blobs_sends_the_checked_out_branch() {
         use lance::dataset::refs::Ref;
-        let ipc = one_row_blob_ipc("image");
+        let ipc = one_row_blob_ipc_stream("image");
         let table = Table::new_with_handler_version(
             "my_table",
             semver::Version::new(0, 5, 0),
@@ -4027,7 +4108,7 @@ mod tests {
                     assert_eq!(body["branch"], "exp", "blob reads must stay on the branch");
                     http::Response::builder()
                         .status(200)
-                        .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                        .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
                         .body(ipc.clone())
                         .unwrap()
                 }
@@ -4047,7 +4128,7 @@ mod tests {
     async fn test_fetch_blobs_sends_a_nested_column_as_a_dotted_path() {
         // The server names the response field with the exact string it was sent, so a
         // nested blob path needs no traversal on either side.
-        let ipc = one_row_blob_ipc("info.blob");
+        let ipc = one_row_blob_ipc_stream("info.blob");
         let table = Table::new_with_handler_version(
             "my_table",
             semver::Version::new(0, 5, 0),
@@ -4056,7 +4137,7 @@ mod tests {
                 assert_eq!(body["column"], "info.blob");
                 http::Response::builder()
                     .status(200)
-                    .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                    .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
                     .body(ipc.clone())
                     .unwrap()
             },
@@ -4067,9 +4148,9 @@ mod tests {
         assert_eq!(blobs.value(0), b"alpha");
     }
 
-    fn write_empty_ipc_file(schema: &Schema) -> Vec<u8> {
+    fn write_empty_ipc_stream(schema: &Schema) -> Vec<u8> {
         let mut body = Vec::new();
-        arrow_ipc::writer::FileWriter::try_new(&mut body, schema)
+        arrow_ipc::writer::StreamWriter::try_new(&mut body, schema)
             .unwrap()
             .finish()
             .unwrap();
@@ -4108,7 +4189,7 @@ mod tests {
             )]))],
         )
         .unwrap();
-        let table = table_with_fetch_blobs_response(write_ipc_file(&batch));
+        let table = table_with_fetch_blobs_response(write_ipc_stream_uncompressed(&batch));
 
         let error = table.fetch_blobs("image", &[10]).await.unwrap_err();
         assert_fetch_blobs_http_error(error, "missing the 'image' column");
@@ -4125,7 +4206,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1]))],
         )
         .unwrap();
-        let table = table_with_fetch_blobs_response(write_ipc_file(&batch));
+        let table = table_with_fetch_blobs_response(write_ipc_stream_uncompressed(&batch));
 
         let error = table.fetch_blobs("image", &[10]).await.unwrap_err();
         assert_fetch_blobs_http_error(
@@ -4153,7 +4234,7 @@ mod tests {
             vec![typed_column],
         )
         .unwrap();
-        let table = table_with_fetch_blobs_response(write_ipc_file(&batch));
+        let table = table_with_fetch_blobs_response(write_ipc_stream_uncompressed(&batch));
 
         let blobs = table.fetch_blobs("image", &[10, 20, 30]).await.unwrap();
         assert_eq!(blobs.len(), 3);
@@ -4175,7 +4256,7 @@ mod tests {
             )]))],
         )
         .unwrap();
-        let table = table_with_fetch_blobs_response(write_ipc_file(&batch));
+        let table = table_with_fetch_blobs_response(write_ipc_stream_uncompressed(&batch));
 
         let error = table.fetch_blobs("image", &[10, 20]).await.unwrap_err();
         assert_fetch_blobs_http_error(error, "returned 1 rows for 2 row ids");
@@ -4184,7 +4265,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_blobs_rejects_zero_batches_for_nonempty_row_ids() {
         let schema = Schema::new(vec![Field::new("image", DataType::LargeBinary, true)]);
-        let table = table_with_fetch_blobs_response(write_empty_ipc_file(&schema));
+        let table = table_with_fetch_blobs_response(write_empty_ipc_stream(&schema));
 
         let error = table.fetch_blobs("image", &[10]).await.unwrap_err();
         assert_fetch_blobs_http_error(error, "returned 0 rows for 1 row ids");
@@ -4241,6 +4322,87 @@ mod tests {
             table.fetch_blob_files("image", &[1]).await.unwrap_err(),
             "Use fetch_blobs for full bytes",
         );
+    }
+
+    #[rstest]
+    #[case(ARROW_STREAM_CONTENT_TYPE)]
+    #[case("application/vnd.apache.arrow.stream; charset=utf-8")]
+    #[case("APPLICATION/VND.APACHE.ARROW.STREAM")]
+    #[tokio::test]
+    async fn test_fetch_blobs_accepts_stream_content_type_variants(
+        #[case] content_type: &'static str,
+    ) {
+        let table = table_with_fetch_blobs_content_type(
+            Some(content_type),
+            write_ipc_stream_uncompressed(&one_row_blob_batch("image")),
+        );
+
+        let blobs = table.fetch_blobs("image", &[10]).await.unwrap();
+
+        assert_eq!(blobs.value(0), b"alpha");
+    }
+
+    // Pins the shared decoder, not the fetch_blobs wire contract. The server frames
+    // fetch_blobs as stream and its own tests enforce that. File stays decodable
+    // because /query still returns it through the same decoder.
+    #[rstest]
+    #[case(ARROW_FILE_CONTENT_TYPE)]
+    #[case("application/vnd.apache.arrow.file; charset=utf-8")]
+    #[case("APPLICATION/VND.APACHE.ARROW.FILE")]
+    #[tokio::test]
+    async fn test_fetch_blobs_accepts_file_content_type_variants(
+        #[case] content_type: &'static str,
+    ) {
+        let table = table_with_fetch_blobs_content_type(
+            Some(content_type),
+            write_ipc_file(&one_row_blob_batch("image")),
+        );
+
+        let blobs = table.fetch_blobs("image", &[10]).await.unwrap();
+
+        assert_eq!(blobs.value(0), b"alpha");
+    }
+
+    #[rstest]
+    #[case(ARROW_STREAM_CONTENT_TYPE, write_ipc_file(&one_row_blob_batch("image")))]
+    #[case(
+        ARROW_FILE_CONTENT_TYPE,
+        write_ipc_stream_uncompressed(&one_row_blob_batch("image"))
+    )]
+    #[tokio::test]
+    async fn test_fetch_blobs_fails_when_the_body_contradicts_the_content_type(
+        #[case] content_type: &'static str,
+        #[case] body: Vec<u8>,
+    ) {
+        let table = table_with_fetch_blobs_content_type(Some(content_type), body);
+
+        let error = table.fetch_blobs("image", &[10]).await.unwrap_err();
+
+        assert!(
+            matches!(error, Error::Arrow { .. }),
+            "expected an Arrow decode failure, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_blobs_rejects_a_response_that_is_not_arrow_ipc() {
+        let table = table_with_fetch_blobs_content_type(
+            Some("application/json"),
+            br#"{"blobs": []}"#.to_vec(),
+        );
+
+        let error = table.fetch_blobs("image", &[10]).await.unwrap_err();
+        assert_fetch_blobs_http_error(error, "got 'application/json'");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_blobs_without_content_type_falls_back_to_file_framing() {
+        let table =
+            table_with_fetch_blobs_content_type(None, write_ipc_file(&one_row_blob_batch("image")));
+
+        let blobs = table.fetch_blobs("image", &[10]).await.unwrap();
+
+        assert_eq!(blobs.value(0), b"alpha");
     }
 
     #[tokio::test]
